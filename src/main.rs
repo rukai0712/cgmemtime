@@ -1,10 +1,17 @@
 use clap::{ArgAction, Parser, Subcommand};
-use std::fs::{metadata, read_dir, File};
+use nix::libc::{proc_pid_rusage, waitid};
+use nix::sys::wait::waitpid;
+use nix::sys::{signal, wait};
+use std::fs::{metadata, read_dir, DirEntry, File, ReadDir};
 use std::io::{Read, Write};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
+use std::time::SystemTime;
 use tempfile::{Builder, TempDir};
+// use nix::unistd::Pid;
+use clone3::Clone3;
 
 fn read_file_string(path: &str) -> Result<String, std::io::Error> {
     let mut contents = String::new();
@@ -22,6 +29,8 @@ pub struct Args {
 
     #[arg(skip)]
     temp_cg_dir: Option<TempDir>,
+    #[arg(skip)]
+    leaf_dir: Option<PathBuf>,
 
     #[arg(action=ArgAction::SetTrue, short='t', help="machine readable output (delimited columns)")]
     machine_readable: bool,
@@ -133,6 +142,7 @@ impl Args {
         let leaf_dir = cg_dir.join("leaf");
         std::fs::create_dir(&leaf_dir)
             .expect(format!("Can't make directory {}", leaf_dir.display()).as_str());
+        self.leaf_dir = Some(leaf_dir);
 
         let sub_ctl_file = cg_dir.join("cgroup.subtree_control");
         let mut file = File::options()
@@ -144,21 +154,63 @@ impl Args {
         file.flush()
             .expect(format!("Flush to file {} failed", sub_ctl_file.display()).as_str());
 
-        // TODO: open fd for leaf_dir
         self
     }
 
-    // fn execute(&self) {
-    //     let SubCmd::Variant(args) = &self.command;
-    //     assert!(args.len() > 0);
-    //     let mut sub_command = Command::new(args[0].as_str());
-    //     for arg in args.iter().skip(1) {
-    //         sub_command.arg(arg);
-    //     }
-    //     let err = sub_command.exec();
-    //     eprintln!("{err}");
-    //     exit(127);
-    // }
+    fn execute(&self) {
+        let leaf_dir = self.leaf_dir.as_ref().unwrap();
+        let fd = File::open(leaf_dir).unwrap().as_raw_fd();
+        // Dir
+        let mut pidfd = -1;
+        let mut clone3 = Clone3::default();
+        clone3
+            .flag_pidfd(&mut pidfd)
+            .flag_vfork()
+            .exit_signal(SIGCHLD)
+            .flag_into_cgroup(&fd);
+
+        let t_start = SystemTime::now();
+
+        match unsafe { clone3.call() }.unwrap() {
+            0 => {
+                // child
+                let SubCmd::Variant(args) = &self.command;
+                assert!(args.len() > 0);
+                let mut sub_command = Command::new(args[0].as_str());
+                for arg in args.iter().skip(1) {
+                    sub_command.arg(arg);
+                }
+                let err = sub_command.exec();
+                eprintln!("{err}");
+                exit(127);
+            }
+            child_pid => {
+                // parent
+                // otherwise, Ctrl+C/+] also kill cgmemtime before it has a chance printing its summary
+                let sa = signal::SigAction::new(
+                    signal::SigHandler::SigIgn,
+                    signal::SaFlags::all(),
+                    signal::SigSet::empty(),
+                );
+                unsafe {
+                    signal::sigaction(signal::Signal::SIGINT, &sa)
+                        .expect("Failed to ignore SIGINT");
+                    signal::sigaction(signal::Signal::SIGQUIT, &sa)
+                        .expect("failed to ignore SIGQUIT");
+                };
+
+                // waitid(idtype, id, infop, options)
+                // waitid(idtype, id, infop, options)
+
+                // proc_pid_rusage(pid, flavor, buffer)
+
+                // waitpid(pid, options)
+
+                // SigAction::new(SigHandler::SigIgn, flags, mask)
+                // sigaction(Signal::SIGINT, sigaction)
+            }
+        }
+    }
 }
 
 fn main() {
@@ -166,7 +218,7 @@ fn main() {
 
     args.check_cgroupfs().check_cgroup_dir().setup_cgroup();
 
-    // app.execute();
+    app.execute();
 
     println!("Disabled systemd run: {args:?}");
 }

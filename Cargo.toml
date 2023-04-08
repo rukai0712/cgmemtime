@@ -7,4 +7,6 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.2.1", features = ["derive"] }
+clone3 = "0.2.3"
+nix = "0.26.2"
 tempfile = "3.5.0"
