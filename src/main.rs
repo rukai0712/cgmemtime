@@ -1,8 +1,11 @@
 use clap::{ArgAction, Parser, Subcommand};
-use nix::libc::{proc_pid_rusage, waitid};
-use nix::sys::wait::waitpid;
-use nix::sys::{signal, wait};
-use std::fs::{metadata, read_dir, DirEntry, File, ReadDir};
+use clone3::Clone3;
+use nix::fcntl;
+use nix::libc;
+use nix::sys::signal;
+use nix::sys::stat::Mode;
+use nix::sys::time::TimeVal;
+use std::fs::{metadata, read_dir, File};
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
@@ -10,14 +13,6 @@ use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
 use std::time::SystemTime;
 use tempfile::{Builder, TempDir};
-// use nix::unistd::Pid;
-use clone3::Clone3;
-
-fn read_file_string(path: &str) -> Result<String, std::io::Error> {
-    let mut contents = String::new();
-    File::open(path)?.take(1024).read_to_string(&mut contents)?;
-    Ok(contents)
-}
 
 #[derive(Parser, Debug)]
 #[command(allow_external_subcommands = true)]
@@ -87,15 +82,19 @@ impl Args {
                     .take(1024)
                     .read_to_string(&mut buf)
                     .expect("Can't read /proc/self/cgroup");
-                let s_pos = buf.find("/").expect("Cgroup does't contain a slash");
+                let s_pos = buf.find("/").expect("Cgroup does't contain a slash") + 1;
                 match buf.find(".service") {
                     Some(e_pos) => {
                         let p_dir = buf.get(s_pos..(e_pos + ".service".len())).unwrap();
+                        let p_dir = Path::new(self.cg_fs_dir.as_str()).join(p_dir);
                         let tmp_dir = Builder::new()
                             .prefix("cgmt-")
                             .rand_bytes(6)
-                            .tempdir_in(p_dir)
-                            .expect(format!("Can't create tempdir in folder '{p_dir}'").as_str());
+                            .tempdir_in(&p_dir)
+                            .expect(
+                                format!("Can't create tempdir in folder '{}'", p_dir.display())
+                                    .as_str(),
+                            );
                         self.temp_cg_dir = Some(tmp_dir);
                     }
                     None => self.reexec_with_systemd_run(),
@@ -157,21 +156,28 @@ impl Args {
         self
     }
 
-    fn execute(&self) {
+    fn execute(self) {
         let leaf_dir = self.leaf_dir.as_ref().unwrap();
-        let fd = File::open(leaf_dir).unwrap().as_raw_fd();
+
+        let fd = fcntl::open(
+            leaf_dir,
+            fcntl::OFlag::O_RDONLY | fcntl::OFlag::O_DIRECTORY,
+            Mode::empty(),
+        )
+        .unwrap();
+
         // Dir
         let mut pidfd = -1;
-        let mut clone3 = Clone3::default();
-        clone3
+        let mut clone = Clone3::default();
+        clone
             .flag_pidfd(&mut pidfd)
             .flag_vfork()
-            .exit_signal(SIGCHLD)
+            .exit_signal(signal::SIGCHLD as u64)
             .flag_into_cgroup(&fd);
 
         let t_start = SystemTime::now();
 
-        match unsafe { clone3.call() }.unwrap() {
+        match unsafe { clone.call() }.unwrap() {
             0 => {
                 // child
                 let SubCmd::Variant(args) = &self.command;
@@ -199,15 +205,33 @@ impl Args {
                         .expect("failed to ignore SIGQUIT");
                 };
 
-                // waitid(idtype, id, infop, options)
-                // waitid(idtype, id, infop, options)
+                let mut status: i32 = 0;
+                let mut usg = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+                let usg = unsafe {
+                    let r = libc::wait4(child_pid, &mut status, 0, usg.as_mut_ptr());
+                    if r < 0 {
+                        panic!("waitid failed");
+                    }
+                    usg.assume_init()
+                };
 
-                // proc_pid_rusage(pid, flavor, buffer)
-
-                // waitpid(pid, options)
-
-                // SigAction::new(SigHandler::SigIgn, flags, mask)
-                // sigaction(Signal::SIGINT, sigaction)
+                let child_user = TimeVal::from(usg.ru_utime);
+                let child_sys = TimeVal::from(usg.ru_stime);
+                let child_wall = SystemTime::now().duration_since(t_start).unwrap();
+                let child_rss_highwater = usg.ru_maxrss * 1024;
+                println!("child_user: {}", child_user);
+                println!("child_sys: {}", child_sys);
+                println!("child_wall: {:?}", child_wall);
+                println!("child_rss_highwater: {}", child_rss_highwater);
+                // read cg rss high
+                let mut buf = String::new();
+                File::open(leaf_dir.join("memory.peak"))
+                    .expect("Can't open memory.peak (requires Kernel 5.19 or later)")
+                    .take(21)
+                    .read_to_string(&mut buf)
+                    .expect("Can't read memory.peak");
+                let cg_rss_highwater: u64 = buf.parse().unwrap();
+                println!("cg_rss_highwater: {}", cg_rss_highwater);
             }
         }
     }
@@ -215,10 +239,6 @@ impl Args {
 
 fn main() {
     let mut args = Args::parse();
-
     args.check_cgroupfs().check_cgroup_dir().setup_cgroup();
-
-    app.execute();
-
-    println!("Disabled systemd run: {args:?}");
+    args.execute();
 }
