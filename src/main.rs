@@ -5,9 +5,9 @@ use nix::libc;
 use nix::sys::signal;
 use nix::sys::stat::Mode;
 use nix::sys::time::TimeVal;
+use std::fs;
 use std::fs::{metadata, read_dir, File};
 use std::io::{Read, Write};
-use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
@@ -23,7 +23,7 @@ pub struct Args {
     cg_dir: Option<String>,
 
     #[arg(skip)]
-    temp_cg_dir: Option<TempDir>,
+    temp_cg_dir: Option<PathBuf>,
     #[arg(skip)]
     leaf_dir: Option<PathBuf>,
 
@@ -94,7 +94,8 @@ impl Args {
                             .expect(
                                 format!("Can't create tempdir in folder '{}'", p_dir.display())
                                     .as_str(),
-                            );
+                            )
+                            .into_path();
                         self.temp_cg_dir = Some(tmp_dir);
                     }
                     None => self.reexec_with_systemd_run(),
@@ -127,7 +128,7 @@ impl Args {
 
     fn setup_cgroup(&mut self) -> &mut Self {
         let cg_dir = if self.temp_cg_dir.is_some() {
-            self.temp_cg_dir.as_ref().unwrap().path()
+            self.temp_cg_dir.as_ref().unwrap().as_path()
         } else if self.cg_dir.is_some() {
             Path::new(self.cg_dir.as_ref().unwrap())
         } else {
@@ -215,14 +216,12 @@ impl Args {
                     usg.assume_init()
                 };
 
+                // resource::Usage::
                 let child_user = TimeVal::from(usg.ru_utime);
                 let child_sys = TimeVal::from(usg.ru_stime);
                 let child_wall = SystemTime::now().duration_since(t_start).unwrap();
                 let child_rss_highwater = usg.ru_maxrss * 1024;
-                println!("child_user: {}", child_user);
-                println!("child_sys: {}", child_sys);
-                println!("child_wall: {:?}", child_wall);
-                println!("child_rss_highwater: {}", child_rss_highwater);
+
                 // read cg rss high
                 let mut buf = String::new();
                 File::open(leaf_dir.join("memory.peak"))
@@ -230,8 +229,28 @@ impl Args {
                     .take(21)
                     .read_to_string(&mut buf)
                     .expect("Can't read memory.peak");
-                let cg_rss_highwater: u64 = buf.parse().unwrap();
+                let cg_rss_highwater: u64 = buf.trim().parse().unwrap();
+
+                println!("child_user: {}", child_user);
+                println!("child_sys: {}", child_sys);
+                println!("child_wall: {:?}", child_wall);
+                println!("child_rss_highwater: {}", child_rss_highwater);
                 println!("cg_rss_highwater: {}", cg_rss_highwater);
+            }
+        }
+    }
+}
+
+impl Drop for Args {
+    fn drop(&mut self) {
+        if let Some(leaf_dir) = self.leaf_dir.take() {
+            if let Err(err) = fs::remove_dir(&leaf_dir) {
+                eprintln!("Failed to remove {}: {:?}", leaf_dir.display(), err);
+            }
+        }
+        if let Some(temp_cg_dir) = self.temp_cg_dir.take() {
+            if let Err(err) = fs::remove_dir(&temp_cg_dir) {
+                eprintln!("Failed to remove {}: {:?}", temp_cg_dir.display(), err);
             }
         }
     }
