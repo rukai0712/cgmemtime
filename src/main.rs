@@ -4,15 +4,16 @@ use nix::fcntl;
 use nix::libc;
 use nix::sys::signal;
 use nix::sys::stat::Mode;
-use nix::sys::time::TimeVal;
+use std::fmt;
 use std::fs;
 use std::fs::{metadata, read_dir, File};
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
+use std::time::Duration;
 use std::time::SystemTime;
-use tempfile::{Builder, TempDir};
+use tempfile::Builder;
 
 #[derive(Parser, Debug)]
 #[command(allow_external_subcommands = true)]
@@ -42,6 +43,15 @@ pub struct Args {
 enum SubCmd {
     #[command(external_subcommand)]
     Variant(Vec<String>),
+}
+
+#[derive(Default, Debug)]
+struct Result {
+    child_user: Duration,
+    child_sys: Duration,
+    child_wall: Duration,
+    child_rss_highwater: i64,
+    cg_rss_highwater: i64,
 }
 
 impl Args {
@@ -157,7 +167,7 @@ impl Args {
         self
     }
 
-    fn execute(self) {
+    fn execute(self) -> Result {
         let leaf_dir = self.leaf_dir.as_ref().unwrap();
 
         let fd = fcntl::open(
@@ -216,11 +226,13 @@ impl Args {
                     usg.assume_init()
                 };
 
-                // resource::Usage::
-                let child_user = TimeVal::from(usg.ru_utime);
-                let child_sys = TimeVal::from(usg.ru_stime);
-                let child_wall = SystemTime::now().duration_since(t_start).unwrap();
-                let child_rss_highwater = usg.ru_maxrss * 1024;
+                let mut result = Result::default();
+                result.child_user = Duration::from_secs(usg.ru_utime.tv_sec as u64)
+                    + Duration::from_nanos(usg.ru_utime.tv_usec as u64);
+                result.child_sys = Duration::from_secs(usg.ru_stime.tv_sec as u64)
+                    + Duration::from_nanos(usg.ru_stime.tv_usec as u64);
+                result.child_wall = SystemTime::now().duration_since(t_start).unwrap();
+                result.child_rss_highwater = usg.ru_maxrss * 1024;
 
                 // read cg rss high
                 let mut buf = String::new();
@@ -229,13 +241,8 @@ impl Args {
                     .take(21)
                     .read_to_string(&mut buf)
                     .expect("Can't read memory.peak");
-                let cg_rss_highwater: u64 = buf.trim().parse().unwrap();
-
-                println!("child_user: {}", child_user);
-                println!("child_sys: {}", child_sys);
-                println!("child_wall: {:?}", child_wall);
-                println!("child_rss_highwater: {}", child_rss_highwater);
-                println!("cg_rss_highwater: {}", cg_rss_highwater);
+                result.cg_rss_highwater = buf.trim().parse().unwrap();
+                return result;
             }
         }
     }
@@ -256,8 +263,24 @@ impl Drop for Args {
     }
 }
 
+impl fmt::Display for Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "user: {:?}\n", self.child_user)?;
+        write!(f, "sys: {:?}\n", self.child_sys)?;
+        write!(f, "wall: {:?}\n", self.child_wall)?;
+        write!(
+            f,
+            "child_RSS_high: {} KiB\n",
+            self.child_rss_highwater / 1024
+        )?;
+        write!(f, "group_mem_high: {} KiB\n", self.cg_rss_highwater / 1024)?;
+        Ok(())
+    }
+}
+
 fn main() {
     let mut args = Args::parse();
     args.check_cgroupfs().check_cgroup_dir().setup_cgroup();
-    args.execute();
+    let result = args.execute();
+    println!("{}", result)
 }
